@@ -134,6 +134,22 @@ class PreTrainedPolicy(nn.Module, HubMixin, abc.ABC):
 
     @classmethod
     def _load_as_safetensor(cls, model: T, model_file: str, map_location: str, strict: bool) -> T:
+        # Check for torch.compile _orig_mod prefix mismatch and fix in-place if needed
+        from safetensors.torch import load_file, save_file
+
+        saved_keys = list(load_file(model_file, device="cpu").keys())
+        model_keys = set(model.state_dict().keys())
+        if saved_keys and all(k.startswith("model._orig_mod.") for k in saved_keys):
+            fixed_keys = {k.replace("model._orig_mod.", "model.") for k in saved_keys}
+            if fixed_keys & model_keys and not (set(saved_keys) & model_keys):
+                logging.warning(
+                    "Detected torch.compile '_orig_mod' prefix in saved weights. "
+                    "Stripping prefix for compatibility."
+                )
+                weights = load_file(model_file, device="cpu")
+                fixed = {k.replace("model._orig_mod.", "model."): v for k, v in weights.items()}
+                save_file(fixed, model_file)
+
         # Create base kwargs
         kwargs = {"strict": strict}
 

@@ -137,6 +137,12 @@ class RobotClientConfig:
         metadata={"help": f"Name of aggregate function to use. Options: {list(AGGREGATE_FUNCTIONS.keys())}"},
     )
 
+    # Recording configuration (save inference data as LeRobot dataset)
+    record: bool = field(default=False, metadata={"help": "Whether to record data during inference"})
+    repo_id: str = field(default="", metadata={"help": "Dataset repository ID for recording (e.g. user/dataset_name)"})
+    dataset_root: str | None = field(default=None, metadata={"help": "Root directory for dataset storage"})
+    use_videos: bool = field(default=True, metadata={"help": "Whether to encode images as videos in the dataset"})
+
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
@@ -170,6 +176,9 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if self.record and not self.repo_id:
+            raise ValueError("repo_id must be provided when record=True")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -190,4 +199,8 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "record": self.record,
+            "repo_id": self.repo_id,
+            "dataset_root": self.dataset_root,
+            "use_videos": self.use_videos,
         }

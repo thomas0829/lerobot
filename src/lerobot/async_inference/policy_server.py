@@ -334,8 +334,10 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.logger.info(f"Policy has queues with keys: {list(self.policy._queues.keys())}")
             self.logger.info(f"Queue sizes before populate: {[(k, len(v)) for k, v in self.policy._queues.items()]}")
             
-            # Stack images into OBS_IMAGES if the policy expects it
-            if self.policy.config.image_features:
+            # Stack images into OBS_IMAGES only for policies that expect it in their queues
+            # (e.g., diffusion, vqbet, act). Pi05 and other policies expect individual image keys.
+            if OBS_IMAGES in self.policy._queues:
+                self.logger.info(f"Policy uses OBS_IMAGES queue, stacking images")
                 self.logger.info(f"Policy image_features: {list(self.policy.config.image_features.keys())}")
                 observation = dict(observation)  # shallow copy
                 try:
@@ -353,9 +355,9 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             self.policy._queues = populate_queues(self.policy._queues, observation, exclude_keys=[ACTION])
             self.logger.info(f"Queue sizes after populate: {[(k, len(v)) for k, v in self.policy._queues.items()]}")
 
-            # Filter observation to only include keys the policy queues expect
-            # This prevents predict_action_chunk from trying to stack empty queues
-            observation = {k: v for k, v in observation.items() if k in self.policy._queues and k != ACTION}
+            # Filter out ACTION from observation (we don't want to pass None/empty action to policy)
+            # Keep all other keys including OBS_IMAGES which is not in queues but needed for prediction
+            observation = {k: v for k, v in observation.items() if k != ACTION}
             self.logger.info(f"Filtered observation keys: {list(observation.keys())}")
 
         self.logger.info(f"Observation keys passed to predict_action_chunk: {list(observation.keys())}")

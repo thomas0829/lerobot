@@ -44,10 +44,14 @@ from typing import Any
 
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import build_dataset_frame, hw_to_dataset_features
+from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -63,6 +67,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
+from lerobot.utils.constants import ACTION, OBS_STR
 
 from .configs import RobotClientConfig
 from .constants import SUPPORTED_ROBOTS
@@ -136,9 +141,87 @@ class RobotClient:
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
 
+        # Recording setup
+        self.dataset = None
+        self._video_encoding_mgr = None
+        self._frame_count = 0
+        if config.record:
+            self._setup_recording()
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+
+    def _setup_recording(self):
+        """Initialize the LeRobot dataset for recording inference data."""
+        # Build dataset features from robot's observation and action features
+        obs_features = hw_to_dataset_features(
+            self.robot.observation_features, OBS_STR, use_video=self.config.use_videos
+        )
+        action_features = hw_to_dataset_features(self.robot.action_features, ACTION)
+        dataset_features = {**obs_features, **action_features}
+
+        num_cameras = len([k for k in self.robot.observation_features if isinstance(self.robot.observation_features[k], tuple)])
+
+        self.dataset = LeRobotDataset.create(
+            repo_id=self.config.repo_id,
+            fps=self.config.fps,
+            root=self.config.dataset_root,
+            robot_type=self.robot.name,
+            features=dataset_features,
+            use_videos=self.config.use_videos,
+            image_writer_processes=0,
+            image_writer_threads=num_cameras * 2,
+        )
+
+        # Enter VideoEncodingManager context for proper cleanup
+        self._video_encoding_mgr = VideoEncodingManager(self.dataset)
+        self._video_encoding_mgr.__enter__()
+
+        self.logger.info(
+            f"Recording enabled: repo_id={self.config.repo_id}, "
+            f"features={list(dataset_features.keys())}, "
+            f"use_videos={self.config.use_videos}"
+        )
+
+    def _record_frame(self, observation: dict, action: dict, task: str):
+        """Record a single frame (observation + action) to the dataset."""
+        if self.dataset is None:
+            return
+
+        try:
+            obs_frame = build_dataset_frame(self.dataset.features, observation, prefix=OBS_STR)
+            action_frame = build_dataset_frame(self.dataset.features, action, prefix=ACTION)
+            frame = {**obs_frame, **action_frame, "task": task}
+            self.dataset.add_frame(frame)
+            self._frame_count += 1
+
+            if self._frame_count % 100 == 0:
+                self.logger.info(f"Recorded {self._frame_count} frames")
+        except Exception as e:
+            self.logger.error(f"Error recording frame: {e}")
+
+    def _save_recording(self):
+        """Save the current episode and finalize the dataset."""
+        if self.dataset is None:
+            return
+
+        try:
+            if self._frame_count > 0:
+                self.logger.info(f"Saving episode with {self._frame_count} frames...")
+                self.dataset.save_episode()
+                self.logger.info(f"Episode saved. Total episodes: {self.dataset.meta.total_episodes}")
+            else:
+                self.logger.info("No frames recorded, skipping episode save.")
+
+            # Exit VideoEncodingManager context (triggers finalize + video encoding)
+            if self._video_encoding_mgr is not None:
+                self._video_encoding_mgr.__exit__(None, None, None)
+                self._video_encoding_mgr = None
+
+            self.logger.info(f"Dataset saved to {self.dataset.root}")
+        except Exception as e:
+            self.logger.error(f"Error saving recording: {e}")
 
     def start(self):
         """Start the robot client and connect to the policy server"""
@@ -173,6 +256,9 @@ class RobotClient:
     def stop(self):
         """Stop the robot client"""
         self.shutdown_event.set()
+
+        # Save recording before disconnecting
+        self._save_recording()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -451,13 +537,21 @@ class RobotClient:
 
         while self.running:
             control_loop_start = time.perf_counter()
+
+            action_this_step = None
+
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
+                action_this_step = _performed_action
 
             """Control loop: (2) Streaming observations to the remote policy server"""
             if self._ready_to_send_observation():
                 _captured_observation = self.control_loop_observation(task, verbose)
+
+            """Control loop: (3) Record frame if recording is enabled"""
+            if self.config.record and action_this_step is not None and _captured_observation is not None:
+                self._record_frame(_captured_observation, action_this_step, task)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
