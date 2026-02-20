@@ -34,10 +34,15 @@ python src/lerobot/async_inference/robot_client.py \
 
 import logging
 import pickle  # nosec
+import shutil
+import sys
+import termios
 import threading
 import time
+import tty
 from collections.abc import Callable
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Queue
 from typing import Any
@@ -67,7 +72,7 @@ from lerobot.transport import (
     services_pb2_grpc,  # type: ignore
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
-from lerobot.utils.constants import ACTION, OBS_STR
+from lerobot.utils.constants import ACTION, HF_LEROBOT_HOME, OBS_STR
 
 from .configs import RobotClientConfig
 from .constants import SUPPORTED_ROBOTS
@@ -83,6 +88,34 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+
+
+def _wait_for_arrow_key():
+    """Block until an arrow key or Ctrl+C is pressed.
+
+    Returns:
+        'right'  — → save and finish episode
+        'left'   — ← cancel episode (discard, repeat)
+        'ctrl_c' — Ctrl+C abort everything
+    """
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":          # ESC — start of arrow escape sequence
+                ch2 = sys.stdin.read(1)
+                if ch2 == "[":
+                    ch3 = sys.stdin.read(1)
+                    if ch3 == "C":   # right arrow: ESC [ C
+                        return "right"
+                    elif ch3 == "D": # left arrow:  ESC [ D
+                        return "left"
+            elif ch == "\x03":        # Ctrl+C
+                return "ctrl_c"
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 class RobotClient:
@@ -141,6 +174,9 @@ class RobotClient:
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
 
+        # Per-episode done event (set to stop current episode loop)
+        self.episode_done = threading.Event()
+
         # Recording setup
         self.dataset = None
         self._video_encoding_mgr = None
@@ -148,9 +184,49 @@ class RobotClient:
         if config.record:
             self._setup_recording()
 
+        # Home position (captured at startup or when explicitly set)
+        self._home_position: dict[str, float] | None = None
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+
+    def _capture_home_position(self):
+        """Read the robot's current joint positions and store as home."""
+        obs = self.robot.get_observation()
+        # Keep only keys that are action features (joint/gripper positions)
+        self._home_position = {
+            k: float(v) for k, v in obs.items() if k in self.robot.action_features
+        }
+        self.logger.info(f"Home position captured: {self._home_position}")
+
+    def _return_home(self):
+        """Smoothly interpolate from the current position back to home."""
+        if self._home_position is None:
+            self.logger.warning("No home position captured, skipping return_home.")
+            return
+
+        steps = self.config.return_home_steps
+        dt = self.config.environment_dt
+
+        # Read current position
+        obs = self.robot.get_observation()
+        current = {k: float(obs[k]) for k in self._home_position}
+
+        self.logger.info(f"Returning to home over {steps} steps ({steps * dt:.1f}s)...")
+        print(f"[Home] Returning to home position ({steps * dt:.1f}s)...")
+
+        for step in range(1, steps + 1):
+            alpha = step / steps
+            target = {
+                k: current[k] + alpha * (self._home_position[k] - current[k])
+                for k in self._home_position
+            }
+            self.robot.send_action(target)
+            time.sleep(dt)
+
+        self.logger.info("Returned to home position.")
+        print("[Home] Done.")
 
     def _setup_recording(self):
         """Initialize the LeRobot dataset for recording inference data."""
@@ -162,6 +238,34 @@ class RobotClient:
         dataset_features = {**obs_features, **action_features}
 
         num_cameras = len([k for k in self.robot.observation_features if isinstance(self.robot.observation_features[k], tuple)])
+
+        # Check if dataset directory already exists and ask user what to do
+        dataset_root = (
+            Path(self.config.dataset_root) if self.config.dataset_root else HF_LEROBOT_HOME / self.config.repo_id
+        )
+        if dataset_root.exists():
+            print(f"\n[WARNING] Dataset directory already exists: {dataset_root}")
+            print("  [d] Delete and start fresh")
+            print("  [r] Rename (append timestamp suffix)")
+            print("  [q] Quit")
+            while True:
+                choice = input("Choice [d/r/q]: ").strip().lower()
+                if choice == "d":
+                    shutil.rmtree(dataset_root)
+                    print(f"[INFO] Deleted {dataset_root}")
+                    break
+                elif choice == "r":
+                    import datetime
+                    suffix = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                    new_path = dataset_root.parent / f"{dataset_root.name}_{suffix}"
+                    dataset_root.rename(new_path)
+                    print(f"[INFO] Renamed to {new_path}")
+                    break
+                elif choice == "q":
+                    print("[INFO] Exiting.")
+                    raise SystemExit(0)
+                else:
+                    print("  Please enter d, r, or q.")
 
         self.dataset = LeRobotDataset.create(
             repo_id=self.config.repo_id,
@@ -201,8 +305,8 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error recording frame: {e}")
 
-    def _save_recording(self):
-        """Save the current episode and finalize the dataset."""
+    def _save_episode(self):
+        """Save the current episode to the dataset (does NOT finalize/push)."""
         if self.dataset is None:
             return
 
@@ -213,15 +317,39 @@ class RobotClient:
                 self.logger.info(f"Episode saved. Total episodes: {self.dataset.meta.total_episodes}")
             else:
                 self.logger.info("No frames recorded, skipping episode save.")
+        except Exception as e:
+            self.logger.error(f"Error saving episode: {e}")
 
+    def _finalize_recording(self):
+        """Finalize and close the dataset (call once after all episodes)."""
+        if self.dataset is None:
+            return
+
+        try:
             # Exit VideoEncodingManager context (triggers finalize + video encoding)
             if self._video_encoding_mgr is not None:
                 self._video_encoding_mgr.__exit__(None, None, None)
                 self._video_encoding_mgr = None
 
-            self.logger.info(f"Dataset saved to {self.dataset.root}")
+            self.logger.info(f"Dataset finalized at {self.dataset.root}")
+
+            # Upload to HuggingFace Hub
+            if self.config.push_to_hub:
+                self.logger.info(f"Uploading dataset to HuggingFace Hub: {self.dataset.repo_id} ...")
+                print(f"[INFO] Uploading to HuggingFace Hub ({self.dataset.repo_id})...")
+                self.dataset.push_to_hub()
+                self.logger.info(f"Dataset uploaded: https://huggingface.co/datasets/{self.dataset.repo_id}")
+                print(f"[INFO] Upload complete: https://huggingface.co/datasets/{self.dataset.repo_id}")
         except Exception as e:
-            self.logger.error(f"Error saving recording: {e}")
+            self.logger.error(f"Error finalizing recording: {e}")
+        finally:
+            # Clear dataset so any accidental second call is a no-op
+            self.dataset = None
+
+    def _save_recording(self):
+        """Save the current episode and finalize the dataset (single-episode convenience wrapper)."""
+        self._save_episode()
+        self._finalize_recording()
 
     def start(self):
         """Start the robot client and connect to the policy server"""
@@ -257,8 +385,8 @@ class RobotClient:
         """Stop the robot client"""
         self.shutdown_event.set()
 
-        # Save recording before disconnecting
-        self._save_recording()
+        # Finalize recording before disconnecting (episodes were already saved)
+        self._finalize_recording()
 
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
@@ -526,38 +654,147 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
-    def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
-        """Combined function for executing actions and streaming observations"""
-        # Wait at barrier for synchronized start
-        self.start_barrier.wait()
-        self.logger.info("Control loop thread starting")
+    def control_loop(
+        self, task: str, verbose: bool = False, episode_timeout_s: float = 0.0
+    ) -> tuple[Observation, Action]:
+        """Combined function for executing actions and streaming observations.
 
+        Runs until shutdown, episode_done is set, or episode_timeout_s is exceeded.
+        """
         _performed_action = None
-        _captured_observation = None
+        _last_recorded_action = None  # last action used for recording (reused when queue is empty)
+        raw_observation = None
 
-        while self.running:
+        episode_start = time.perf_counter()
+
+        while self.running and not self.episode_done.is_set():
             control_loop_start = time.perf_counter()
 
-            action_this_step = None
+            # Check episode timeout
+            if episode_timeout_s > 0 and (time.perf_counter() - episode_start) >= episode_timeout_s:
+                self.logger.info(f"Episode timeout reached ({episode_timeout_s:.1f}s), ending episode.")
+                self.episode_done.set()
+                break
 
-            """Control loop: (1) Performing actions, when available"""
+            """Control loop: (1) Always capture a fresh observation from the robot (for recording + sending)"""
+            raw_observation: RawObservation = self.robot.get_observation()
+            raw_observation["task"] = task
+
+            # Extract actual current joint positions from observation (used as fallback action for recording)
+            current_joint_action = {k: v for k, v in raw_observation.items() if k in self.robot.action_features}
+
+            """Control loop: (2) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
-                action_this_step = _performed_action
+                _last_recorded_action = _performed_action
+            else:
+                # When queue is empty, record actual joint state instead of repeating stale command
+                _last_recorded_action = current_joint_action
 
-            """Control loop: (2) Streaming observations to the remote policy server"""
+            """Control loop: (3) Send observation to server when queue is low enough"""
             if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+                with self.latest_action_lock:
+                    latest_action = self.latest_action
+                observation = TimedObservation(
+                    timestamp=time.time(),
+                    observation=raw_observation,
+                    timestep=max(latest_action, 0),
+                )
+                with self.action_queue_lock:
+                    observation.must_go = self.must_go.is_set() and self.action_queue.empty()
+                _ = self.send_observation(observation)
+                if observation.must_go:
+                    self.must_go.clear()
+                if verbose:
+                    fps_metrics = self.fps_tracker.calculate_fps_metrics(observation.get_timestamp())
+                    self.logger.info(
+                        f"Obs #{observation.get_timestep()} | "
+                        f"Avg FPS: {fps_metrics['avg_fps']:.2f} | "
+                        f"Target: {fps_metrics['target_fps']:.2f}"
+                    )
 
-            """Control loop: (3) Record frame if recording is enabled"""
-            if self.config.record and action_this_step is not None and _captured_observation is not None:
-                self._record_frame(_captured_observation, action_this_step, task)
+            """Control loop: (4) Record frame every loop at full fps.
+            Use the last known action when no new action was executed this step."""
+            if self.config.record and _last_recorded_action is not None:
+                self._record_frame(raw_observation, _last_recorded_action, task)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
             time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
 
-        return _captured_observation, _performed_action
+        return raw_observation, _performed_action
+
+    def run_episodes(self, task: str, num_episodes: int, episode_timeout_s: float = 0.0, verbose: bool = False):
+        """Run multiple episodes, prompting for Enter before each one.
+
+        Press Enter to start each episode.
+        While the episode is running, press Enter again to stop it early.
+        The episode also ends automatically when episode_timeout_s is exceeded (if > 0).
+        After all episodes the dataset is finalized.
+        """
+        # Sync with the receive_actions thread (barrier)
+        self.start_barrier.wait()
+        self.logger.info("Episode runner starting")
+
+        # Capture home position from the robot's current state
+        if self.config.return_home:
+            self._capture_home_position()
+
+        timeout_str = f"{episode_timeout_s:.0f}s timeout" if episode_timeout_s > 0 else "no timeout"
+
+        ep_idx = 0
+        while ep_idx < num_episodes:
+            print(f"\n[Episode {ep_idx + 1}/{num_episodes}] Press Enter to start ({timeout_str})...")
+            try:
+                input()
+            except KeyboardInterrupt:
+                print("\nAborted by user.")
+                break
+
+            # Reset per-episode state
+            self.episode_done.clear()
+            with self.action_queue_lock:
+                self.action_queue = Queue()
+            with self.latest_action_lock:
+                self.latest_action = -1
+            self.action_chunk_size = -1
+            self.must_go.set()
+            self._frame_count = 0
+
+            print(f"[Episode {ep_idx + 1}/{num_episodes}] Running... (→ save & next | ← cancel & retry)")
+
+            # Run control loop in a background thread so the main thread can
+            # listen for arrow keys to control the episode.
+            control_thread = threading.Thread(
+                target=self.control_loop,
+                kwargs={"task": task, "verbose": verbose, "episode_timeout_s": episode_timeout_s},
+                daemon=True,
+            )
+            control_thread.start()
+
+            # Block until an arrow key or Ctrl+C.
+            key = _wait_for_arrow_key()
+            self.episode_done.set()
+            control_thread.join()
+
+            if key == "ctrl_c":
+                print(f"\n[Episode {ep_idx + 1}/{num_episodes}] Aborted.")
+                break
+
+            # Return to home regardless of save/cancel
+            if self.config.return_home:
+                self._return_home()
+
+            if key == "left":
+                print(f"[Episode {ep_idx + 1}/{num_episodes}] Cancelled — retrying same episode.")
+                # Do NOT save and do NOT increment ep_idx
+            else:  # 'right' or timeout
+                print(f"[Episode {ep_idx + 1}/{num_episodes}] Saving episode...")
+                self._save_episode()
+                ep_idx += 1
+
+        # Finalize dataset after all episodes
+        self._finalize_recording()
 
 
 @draccus.wrap()
@@ -574,17 +811,22 @@ def async_client(cfg: RobotClientConfig):
 
         # Create and start action receiver thread
         action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
-
-        # Start action receiver thread
         action_receiver_thread.start()
 
         try:
-            # The main thread runs the control loop
-            client.control_loop(task=cfg.task)
+            # The main thread runs the episode loop (handles barrier sync internally)
+            client.run_episodes(
+                task=cfg.task,
+                num_episodes=cfg.num_episodes,
+                episode_timeout_s=cfg.episode_timeout_s,
+            )
+
+        except KeyboardInterrupt:
+            client.logger.info("Interrupted by user.")
 
         finally:
             client.stop()
-            action_receiver_thread.join()
+            action_receiver_thread.join(timeout=5)
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
             client.logger.info("Client stopped")

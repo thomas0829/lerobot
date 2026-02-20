@@ -300,11 +300,18 @@ def decode_video_frames_torchcodec(
     return closest_frames
 
 
+# Codecs that do NOT support yuv444p pixel format
+_CODECS_NO_YUV444P = {"libsvtav1", "hevc", "h264_nvenc"}
+
+# All supported video encoder codecs
+SUPPORTED_VIDEO_CODECS = ["h264", "hevc", "libsvtav1", "h264_nvenc"]
+
+
 def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
     fps: int,
-    vcodec: str = "libsvtav1",
+    vcodec: str = "h264_nvenc",
     pix_fmt: str = "yuv420p",
     g: int | None = 2,
     crf: int | None = 30,
@@ -314,8 +321,11 @@ def encode_video_frames(
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     # Check encoder availability
-    if vcodec not in ["h264", "hevc", "libsvtav1"]:
-        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
+    if vcodec not in SUPPORTED_VIDEO_CODECS:
+        raise ValueError(
+            f"Unsupported video codec: {vcodec}. "
+            f"Supported codecs are: {', '.join(SUPPORTED_VIDEO_CODECS)}."
+        )
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
@@ -327,7 +337,7 @@ def encode_video_frames(
     video_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Encoders/pixel formats incompatibility check
-    if (vcodec == "libsvtav1" or vcodec == "hevc") and pix_fmt == "yuv444p":
+    if vcodec in _CODECS_NO_YUV444P and pix_fmt == "yuv444p":
         logging.warning(
             f"Incompatible pixel format 'yuv444p' for codec {vcodec}, auto-selecting format 'yuv420p'"
         )
@@ -348,16 +358,31 @@ def encode_video_frames(
     # Define video codec options
     video_options = {}
 
-    if g is not None:
-        video_options["g"] = str(g)
+    if vcodec == "h264_nvenc":
+        # NVENC hardware encoder uses different parameters than software encoders:
+        #   - 'qp' instead of 'crf' for constant-quality mode
+        #   - 'preset' uses p1 (fastest) to p7 (best quality)
+        #   - 'bf=0' disables B-frames (GOP length must be > B-frames + 1)
+        if g is not None:
+            video_options["g"] = str(g)
+        if crf is not None:
+            # Map CRF to NVENC constant QP (similar scale, reasonable approximation)
+            video_options["qp"] = str(crf)
+        video_options["preset"] = "p4"  # balanced speed/quality
+        video_options["tune"] = "hq"
+        video_options["rc"] = "constqp"  # constant QP rate control
+        video_options["bf"] = "0"  # no B-frames; avoids "Gop Length > B-frames + 1" error
+    else:
+        if g is not None:
+            video_options["g"] = str(g)
 
-    if crf is not None:
-        video_options["crf"] = str(crf)
+        if crf is not None:
+            video_options["crf"] = str(crf)
 
-    if fast_decode:
-        key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
-        value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
-        video_options[key] = value
+        if fast_decode:
+            key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
+            value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
+            video_options[key] = value
 
     # Set logging level
     if log_level is not None:

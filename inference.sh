@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Use local HF cache only (repos removed from Hub)
+# export HF_HUB_OFFLINE=1
+
 python -m lerobot.async_inference.robot_client \
   --server_address=localhost:8000 \
   --robot.type=bi_yam_follower \
@@ -10,16 +13,20 @@ python -m lerobot.async_inference.robot_client \
     left:  {"type": "intelrealsense", "serial_number_or_name": "218622275075", "width": 640, "height": 360, "fps": 30},
     top:   {"type": "intelrealsense", "serial_number_or_name": "215222073684", "width": 640, "height": 360, "fps": 30}
   }' \
-  --task="Put the dolls on the cloth." \
+  --task="Flatten the towel." \
   --policy_type=pi05 \
-  --pretrained_name_or_path=sengi/pi05_put_dolls_cloth_lerobot \
+  --pretrained_name_or_path=thomas0829/folding_towel_pi05 \
   --policy_device=cuda \
   --actions_per_chunk=30 \
   --chunk_size_threshold=0.0 \
   --aggregate_fn_name=weighted_average \
   --record=true \
-  --repo_id=thomas0829/inference_put_dolls_cloth \
-  --use_videos=true
+  --repo_id=thomas0829/flatten_towel_pi05_test \
+  --use_videos=true \
+  --num_episodes=2 \
+  --episode_timeout_s=90 \
+  --return_home=true \
+  --return_home_steps=50
 
 
 #python start_follower_servers.py

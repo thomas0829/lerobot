@@ -142,6 +142,11 @@ class RobotClientConfig:
     repo_id: str = field(default="", metadata={"help": "Dataset repository ID for recording (e.g. user/dataset_name)"})
     dataset_root: str | None = field(default=None, metadata={"help": "Root directory for dataset storage"})
     use_videos: bool = field(default=True, metadata={"help": "Whether to encode images as videos in the dataset"})
+    num_episodes: int = field(default=1, metadata={"help": "Number of episodes to record"})
+    episode_timeout_s: float = field(default=60.0, metadata={"help": "Max seconds per episode (0 = no timeout)"})
+    return_home: bool = field(default=True, metadata={"help": "Whether to return to home position after each episode"})
+    return_home_steps: int = field(default=50, metadata={"help": "Interpolation steps for returning to home position"})
+    push_to_hub: bool = field(default=True, metadata={"help": "Whether to push the dataset to HuggingFace Hub after recording"})
 
     # Debug configuration
     debug_visualize_queue_size: bool = field(
@@ -179,6 +184,15 @@ class RobotClientConfig:
         if self.record and not self.repo_id:
             raise ValueError("repo_id must be provided when record=True")
 
+        if self.num_episodes < 1:
+            raise ValueError(f"num_episodes must be >= 1, got {self.num_episodes}")
+
+        if self.episode_timeout_s < 0:
+            raise ValueError(f"episode_timeout_s must be >= 0, got {self.episode_timeout_s}")
+
+        if self.return_home_steps < 1:
+            raise ValueError(f"return_home_steps must be >= 1, got {self.return_home_steps}")
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -203,4 +217,9 @@ class RobotClientConfig:
             "repo_id": self.repo_id,
             "dataset_root": self.dataset_root,
             "use_videos": self.use_videos,
+            "num_episodes": self.num_episodes,
+            "episode_timeout_s": self.episode_timeout_s,
+            "return_home": self.return_home,
+            "return_home_steps": self.return_home_steps,
+            "push_to_hub": self.push_to_hub,
         }
