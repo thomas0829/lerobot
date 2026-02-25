@@ -894,7 +894,9 @@ class PI05Policy(PreTrainedPolicy):
         if config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        self.model.to(config.device)
+        # Ignore device from config (may reference GPUs not available on this machine).
+        # The caller (e.g. policy_server) is responsible for calling .to(device) afterwards.
+        self.model.to("cpu")
 
         self.reset()
 

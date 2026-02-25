@@ -13,18 +13,19 @@ python -m lerobot.async_inference.robot_client \
     left:  {"type": "intelrealsense", "serial_number_or_name": "218622275075", "width": 640, "height": 360, "fps": 30},
     top:   {"type": "intelrealsense", "serial_number_or_name": "215222073684", "width": 640, "height": 360, "fps": 30}
   }' \
-  --task="Flatten the towel." \
+  --task="Fold the towel." \
   --policy_type=pi05 \
-  --pretrained_name_or_path=thomas0829/folding_towel_pi05 \
+  --pretrained_name_or_path=sengi/rabc_pi05_folding_towel_adv \
   --policy_device=cuda \
   --actions_per_chunk=30 \
   --chunk_size_threshold=0.0 \
+  --fps=10 \
   --aggregate_fn_name=weighted_average \
   --record=true \
-  --repo_id=thomas0829/flatten_towel_pi05_test \
+  --repo_id=thomas0829/fold_towel_pi05 \
   --use_videos=true \
-  --num_episodes=2 \
-  --episode_timeout_s=90 \
+  --num_episodes=10 \
+  --episode_timeout_s=900 \
   --return_home=true \
   --return_home_steps=50
 
