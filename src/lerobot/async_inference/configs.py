@@ -63,6 +63,22 @@ class PolicyServerConfig:
     obs_queue_timeout: float = field(
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
+    trace_state_action_chunks: bool = field(
+        default=False,
+        metadata={"help": "Log observation state and predicted action chunks during inference"},
+    )
+    trace_state_action_chunks_path: str = field(
+        default="",
+        metadata={"help": "Optional text file path for state/chunk traces. Empty logs to the regular logger only"},
+    )
+    trace_state_action_chunks_include_full_chunk: bool = field(
+        default=True,
+        metadata={"help": "Whether to include every action in the predicted chunk trace"},
+    )
+    trace_state_action_chunks_precision: int = field(
+        default=6,
+        metadata={"help": "Floating-point precision used when formatting traced states and chunks"},
+    )
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -77,6 +93,12 @@ class PolicyServerConfig:
 
         if self.obs_queue_timeout < 0:
             raise ValueError(f"obs_queue_timeout must be non-negative, got {self.obs_queue_timeout}")
+
+        if self.trace_state_action_chunks_precision < 0:
+            raise ValueError(
+                "trace_state_action_chunks_precision must be non-negative, "
+                f"got {self.trace_state_action_chunks_precision}"
+            )
 
     @classmethod
     def from_dict(cls, config_dict: dict) -> "PolicyServerConfig":
@@ -96,6 +118,10 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "trace_state_action_chunks": self.trace_state_action_chunks,
+            "trace_state_action_chunks_path": self.trace_state_action_chunks_path,
+            "trace_state_action_chunks_include_full_chunk": self.trace_state_action_chunks_include_full_chunk,
+            "trace_state_action_chunks_precision": self.trace_state_action_chunks_precision,
         }
 
 

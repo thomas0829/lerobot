@@ -18,6 +18,7 @@ import builtins
 import logging
 import math
 from collections import deque
+from contextlib import nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -30,6 +31,15 @@ from lerobot.utils.import_utils import _transformers_available
 
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
+    try:
+        from transformers.modeling_utils import no_init_weights
+    except ImportError:
+        try:
+            from transformers.utils import init as transformers_init
+        except ImportError:
+            no_init_weights = None
+        else:
+            no_init_weights = getattr(transformers_init, "no_init_weights", None)
     from transformers.models.auto import CONFIG_MAPPING
     from transformers.models.gemma import modeling_gemma
     from transformers.models.gemma.modeling_gemma import GemmaForCausalLM
@@ -39,6 +49,7 @@ else:
     modeling_gemma = None
     GemmaForCausalLM = None
     PaliGemmaForConditionalGeneration = None
+    no_init_weights = None
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
@@ -56,6 +67,35 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+def _policy_no_init_context():
+    if no_init_weights is None:
+        return nullcontext()
+    return no_init_weights()
+
+
+def _restore_missing_tied_weight_keys(state_dict: dict[str, Tensor]) -> tuple[dict[str, Tensor], list[str]]:
+    restored_keys = []
+    tied_weight_pairs = [
+        (
+            "model.paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight",
+            "model.paligemma_with_expert.paligemma.lm_head.weight",
+        )
+    ]
+
+    updated_state_dict = dict(state_dict)
+    for primary_key, tied_key in tied_weight_pairs:
+        primary_present = primary_key in updated_state_dict
+        tied_present = tied_key in updated_state_dict
+        if primary_present == tied_present:
+            continue
+
+        source_key, target_key = (primary_key, tied_key) if primary_present else (tied_key, primary_key)
+        updated_state_dict[target_key] = updated_state_dict[source_key]
+        restored_keys.append(target_key)
+
+    return updated_state_dict, restored_keys
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -376,6 +416,11 @@ class PaliGemmaWithExpertModel(
 
         self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
         self.gemma_expert = GemmaForCausalLM(config=action_expert_config_hf)
+
+        # `no_init_weights()` skips the usual transformers tie pass, so restore the
+        # embedding/output ties explicitly before dropping the unused expert embeddings.
+        self.paligemma.tie_weights()
+        self.gemma_expert.tie_weights()
         self.gemma_expert.model.embed_tokens = None
 
         self.to_bfloat16_for_selected_params(precision)
@@ -941,7 +986,8 @@ class PI05Policy(PreTrainedPolicy):
 
         # Initialize model without loading weights
         # Check if dataset_stats were provided in kwargs
-        model = cls(config, **kwargs)
+        with _policy_no_init_context():
+            model = cls(config, **kwargs)
 
         # Now manually load and remap the state dict
         try:
@@ -991,8 +1037,13 @@ class PI05Policy(PreTrainedPolicy):
             if remap_count > 0:
                 print(f"Remapped {remap_count} state dict keys")
 
+            remapped_state_dict, restored_tied_keys = _restore_missing_tied_weight_keys(remapped_state_dict)
+            if restored_tied_keys:
+                print(f"Restored {len(restored_tied_keys)} tied state dict keys")
+
             # Load the remapped state dict into the model
             missing_keys, unexpected_keys = model.load_state_dict(remapped_state_dict, strict=strict)
+            model.model.paligemma_with_expert.paligemma.tie_weights()
 
             if missing_keys:
                 print(f"Missing keys when loading state dict: {len(missing_keys)} keys")

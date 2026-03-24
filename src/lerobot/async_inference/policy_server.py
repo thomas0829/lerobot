@@ -30,25 +30,25 @@ import threading
 import time
 from concurrent import futures
 from dataclasses import asdict
+from pathlib import Path
 from pprint import pformat
 from queue import Empty, Queue
 from typing import Any
+
 import draccus
 import grpc
+import numpy as np
 import torch
 
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
+from lerobot.policies.utils import populate_queues
 from lerobot.processor import (
     PolicyAction,
     PolicyProcessorPipeline,
 )
-from lerobot.transport import (
-    services_pb2,  # type: ignore
-    services_pb2_grpc,  # type: ignore
-)
+from lerobot.transport import services_pb2, services_pb2_grpc  # type: ignore
 from lerobot.transport.utils import receive_bytes_in_chunks
-from lerobot.policies.utils import populate_queues
-from lerobot.utils.constants import OBS_IMAGES, ACTION
+from lerobot.utils.constants import ACTION, OBS_IMAGES, OBS_STATE
 
 from .configs import PolicyServerConfig
 from .constants import SUPPORTED_POLICIES
@@ -79,6 +79,15 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         self._predicted_timesteps_lock = threading.Lock()
         self._predicted_timesteps = set()
+        self._trace_lock = threading.Lock()
+        self._prediction_counter = 0
+        self._trace_output_path = (
+            Path(config.trace_state_action_chunks_path).expanduser()
+            if config.trace_state_action_chunks_path
+            else None
+        )
+        if self._trace_output_path is not None:
+            self._trace_output_path.parent.mkdir(parents=True, exist_ok=True)
 
         self.last_processed_obs = None
 
@@ -323,17 +332,103 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             for i, action in enumerate(action_chunk)
         ]
 
+    def _next_prediction_index(self) -> int:
+        with self._trace_lock:
+            self._prediction_counter += 1
+            return self._prediction_counter
+
+    def _format_trace_array(self, value: torch.Tensor | np.ndarray | Any) -> str:
+        if isinstance(value, torch.Tensor):
+            array = value.detach().cpu().numpy()
+        else:
+            array = np.asarray(value)
+
+        return np.array2string(
+            array,
+            precision=self.config.trace_state_action_chunks_precision,
+            separator=" ",
+            suppress_small=False,
+            max_line_width=120,
+        )
+
+    def _build_prediction_trace_lines(
+        self,
+        prediction_idx: int,
+        timestep: int,
+        state_tensor: torch.Tensor | None,
+        action_tensor: torch.Tensor,
+    ) -> list[str]:
+        lines: list[str] = []
+
+        if state_tensor is None:
+            state_str = "N/A"
+        else:
+            if state_tensor.ndim > 1 and state_tensor.shape[0] == 1:
+                state_tensor = state_tensor.squeeze(0)
+            state_str = self._format_trace_array(state_tensor)
+
+        chunk_len = int(action_tensor.shape[0]) if action_tensor.ndim > 0 else 0
+        first_action = action_tensor[0] if chunk_len > 0 else None
+        last_action = action_tensor[-1] if chunk_len > 0 else None
+
+        lines.append(f"[Predict {prediction_idx}] State for timestep {timestep}: {state_str}")
+
+        if chunk_len == 0:
+            lines.append(f"[Predict {prediction_idx}] Chunk for timestep {timestep} is empty.")
+            return lines
+
+        lines.append(
+            f"[Predict {prediction_idx}] Chunk for timestep {timestep} with {chunk_len} actions. "
+            f"First: {self._format_trace_array(first_action)}, "
+            f"Last: {self._format_trace_array(last_action)}"
+        )
+
+        if self.config.trace_state_action_chunks_include_full_chunk:
+            lines.append(f"[Predict {prediction_idx}] Full chunk for timestep {timestep}:")
+            for offset, action in enumerate(action_tensor):
+                lines.append(f"  [{offset:02d}] {self._format_trace_array(action)}")
+
+        return lines
+
+    def _emit_prediction_trace(
+        self,
+        timestep: int,
+        state_tensor: torch.Tensor | None,
+        action_tensor: torch.Tensor,
+    ) -> None:
+        if not self.config.trace_state_action_chunks:
+            return
+
+        prediction_idx = self._next_prediction_index()
+        lines = self._build_prediction_trace_lines(
+            prediction_idx=prediction_idx,
+            timestep=timestep,
+            state_tensor=state_tensor,
+            action_tensor=action_tensor,
+        )
+
+        for line in lines:
+            self.logger.info(line)
+
+        if self._trace_output_path is None:
+            return
+
+        with self._trace_lock:
+            with self._trace_output_path.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines))
+                handle.write("\n")
+
     def _get_action_chunk(self, observation: dict[str, torch.Tensor]) -> torch.Tensor:
         """Get an action chunk from the policy."""
-        
+
         self.logger.info(f"Observation keys before processing: {list(observation.keys())}")
-        
+
         # For policies that use internal queues (diffusion, vqbet, tdmpc),
         # we need to populate their queues before calling predict_action_chunk
         if hasattr(self.policy, '_queues') and self.policy._queues is not None:
             self.logger.info(f"Policy has queues with keys: {list(self.policy._queues.keys())}")
             self.logger.info(f"Queue sizes before populate: {[(k, len(v)) for k, v in self.policy._queues.items()]}")
-            
+
             # Stack images into OBS_IMAGES only for policies that expect it in their queues
             # (e.g., diffusion, vqbet, act). Pi05 and other policies expect individual image keys.
             if OBS_IMAGES in self.policy._queues:
@@ -342,8 +437,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
                 observation = dict(observation)  # shallow copy
                 try:
                     observation[OBS_IMAGES] = torch.stack(
-                        [observation[key] for key in self.policy.config.image_features],
-                        dim=-4
+                        [observation[key] for key in self.policy.config.image_features], dim=-4
                     )
                     self.logger.info(f"Stacked images shape: {observation[OBS_IMAGES].shape}")
                 except KeyError as e:
@@ -363,7 +457,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.logger.info(f"Observation keys passed to predict_action_chunk: {list(observation.keys())}")
         chunk = self.policy.predict_action_chunk(observation)
         self.logger.info(f"Action chunk shape from policy: {chunk.shape}")
-        
+
         if chunk.ndim != 3:
             chunk = chunk.unsqueeze(0)
 
@@ -381,7 +475,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         """
         """1. Prepare observation"""
         start_prepare = time.perf_counter()
-        observation: Observation = raw_observation_to_observation(
+        prepared_observation: Observation = raw_observation_to_observation(
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
@@ -390,7 +484,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         """2. Apply preprocessor"""
         start_preprocess = time.perf_counter()
-        observation = self.preprocessor(observation)
+        observation = self.preprocessor(prepared_observation)
         self.last_processed_obs: TimedObservation = observation_t
         preprocessing_time = time.perf_counter() - start_preprocess
 
@@ -423,6 +517,11 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
 
         # Move actions to CPU for serialization (client may not have CUDA)
         action_tensor = action_tensor.cpu()
+        self._emit_prediction_trace(
+            timestep=observation_t.get_timestep(),
+            state_tensor=prepared_observation.get(OBS_STATE),
+            action_tensor=action_tensor,
+        )
 
         """5. Convert to TimedAction list"""
         action_chunk = self._time_action_chunk(

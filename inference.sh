@@ -15,7 +15,7 @@ python -m lerobot.async_inference.robot_client \
   }' \
   --task="Fold the towel." \
   --policy_type=pi05 \
-  --pretrained_name_or_path=sengi/rabc_pi05_folding_towel_adv \
+  --pretrained_name_or_path=thomas0829/folding_towel_pi05 \
   --policy_device=cuda \
   --actions_per_chunk=30 \
   --chunk_size_threshold=0.0 \
